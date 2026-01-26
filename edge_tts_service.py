@@ -94,13 +94,14 @@ class TTSService:
             if cmd == "speak":
                 text = msg.get("text", "")
                 voice = msg.get("voice", self._current_voice)
+                rate = msg.get("rate", 0)
 
                 if self._current_task and not self._current_task.done():
                     await self._cancel_current()
 
                 self._current_voice = voice
                 request_ts = time.time()
-                self._current_task = asyncio.create_task(self._speak_and_stream(text, voice, request_ts))
+                self._current_task = asyncio.create_task(self._speak_and_stream(text, voice, rate, request_ts))
 
             elif cmd == "cancel":
                 await self._cancel_current()
@@ -120,7 +121,7 @@ class TTSService:
 
         await self.shutdown()
 
-    async def _speak_and_stream(self, text: str, voice: str, request_ts: float):
+    async def _speak_and_stream(self, text: str, voice: str, rate: int, request_ts: float):
         import time
         from datetime import datetime, timezone
         
@@ -132,11 +133,11 @@ class TTSService:
             return
 
         send_status({"status": "speaking", "ts": now_iso(), "request_ts": request_ts, "voice": voice})
-        logger.info("Starting synthesis (voice=%s)", voice)
+        logger.info("Starting synthesis (voice=%s, rate=%+d)", voice, rate)
 
         try:
             import edge_tts
-            communicate = edge_tts.Communicate(text, voice)
+            communicate = edge_tts.Communicate(text, voice, rate=f"{rate * 5:+d}%")
         except Exception as e:
             logger.exception("edge_tts init failed: %s", e)
             send_status({"status": "error", "message": f"init failed: {e}", "ts": now_iso()})

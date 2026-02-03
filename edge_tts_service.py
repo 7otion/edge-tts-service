@@ -5,6 +5,7 @@ import json
 import asyncio
 import signal
 import logging
+import struct
 
 # ---------- Logging & binary stdout ----------
 
@@ -136,12 +137,7 @@ class TTSService:
 
         try:
             import edge_tts
-            # Edge TTS returns MP3 by default - stream it directly!
-            communicate = edge_tts.Communicate(
-                text, 
-                voice, 
-                rate=f"{rate * 5:+d}%"
-            )
+            communicate = edge_tts.Communicate(text, voice, rate=f"{rate * 5:+d}%")
         except Exception as e:
             logger.exception("edge_tts init failed: %s", e)
             send_status({"status": "error", "message": f"init failed: {e}", "ts": now_iso()})
@@ -151,37 +147,84 @@ class TTSService:
             out = sys.stdout.buffer
             first_chunk_time = None
             chunk_count = 0
+            pcm_chunks_sent = 0
             
-            # Stream MP3 directly from edge-tts to stdout (no conversion needed!)
-            async for chunk in communicate.stream():
-                if asyncio.current_task().cancelled():
-                    raise asyncio.CancelledError()
+            # Start ffmpeg using asyncio subprocess
+            ffmpeg_process = await asyncio.create_subprocess_exec(
+                'ffmpeg', '-i', 'pipe:0', '-f', 's16le', '-acodec', 'pcm_s16le',
+                '-ar', '24000', '-ac', '1', 'pipe:1',
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            
+            # Task to feed MP3 data to ffmpeg
+            async def feed_ffmpeg():
+                nonlocal first_chunk_time, chunk_count
+                try:
+                    async for chunk in communicate.stream():
+                        if asyncio.current_task().cancelled():
+                            raise asyncio.CancelledError()
 
-                # Extract MP3 data from chunk
-                mp3_data = None
-                if isinstance(chunk, (bytes, bytearray)):
-                    mp3_data = bytes(chunk)
-                elif isinstance(chunk, dict):
-                    if "data" in chunk:
-                        mp3_data = bytes(chunk["data"])
-                    elif "audio" in chunk:
-                        mp3_data = bytes(chunk["audio"])
+                        data_bytes = None
+                        if isinstance(chunk, (bytes, bytearray)):
+                            data_bytes = bytes(chunk)
+                        elif isinstance(chunk, dict):
+                            if "data" in chunk:
+                                data_bytes = bytes(chunk["data"])
+                            elif "audio" in chunk:
+                                data_bytes = bytes(chunk["audio"])
 
-                if not mp3_data:
-                    continue
+                        if not data_bytes:
+                            continue
 
-                if first_chunk_time is None:
-                    first_chunk_time = time.time()
-                    send_status({
-                        "status": "first_audio",
-                        "ts": now_iso(),
-                        "first_audio_ms": int((first_chunk_time - request_ts) * 1000)
-                    })
+                        if first_chunk_time is None:
+                            first_chunk_time = time.time()
+                            send_status({
+                                "status": "first_audio",
+                                "ts": now_iso(),
+                                "first_audio_ms": int((first_chunk_time - request_ts) * 1000)
+                            })
 
-                # Write raw MP3 directly to stdout
-                out.write(mp3_data)
-                out.flush()
-                chunk_count += 1
+                        # Feed MP3 to ffmpeg
+                        ffmpeg_process.stdin.write(data_bytes)
+                        await ffmpeg_process.stdin.drain()
+                        chunk_count += 1
+                        
+                except Exception as e:
+                    logger.error(f"Error feeding ffmpeg: {e}")
+                finally:
+                    ffmpeg_process.stdin.close()
+                    await ffmpeg_process.stdin.wait_closed()
+            
+            # Task to read PCM from ffmpeg
+            async def read_pcm():
+                nonlocal pcm_chunks_sent
+                pcm_chunk_size = 4800  # 100ms at 24kHz mono 16-bit
+                
+                while True:
+                    try:
+                        pcm_data = await ffmpeg_process.stdout.read(pcm_chunk_size)
+                        if not pcm_data:
+                            break
+                        
+                        # Send header: sample_rate (4 bytes), channels (2 bytes), num_samples (4 bytes)
+                        num_samples = len(pcm_data) // 2
+                        header = struct.pack('<IHI', 24000, 1, num_samples)
+                        out.write(header)
+                        out.write(pcm_data)
+                        out.flush()
+                        pcm_chunks_sent += 1
+                        
+                    except Exception as e:
+                        logger.error(f"Error reading PCM: {e}")
+                        break
+            
+            # Run both tasks concurrently
+            await asyncio.gather(feed_ffmpeg(), read_pcm())
+            
+            # Wait for ffmpeg to finish
+            await ffmpeg_process.wait()
 
             finished_ts = time.time()
             synthesis_ms = int((finished_ts - request_ts) * 1000)
@@ -190,17 +233,25 @@ class TTSService:
                 "status": "finished",
                 "ts": now_iso(),
                 "synthesis_ms": synthesis_ms,
-                "chunks": chunk_count
+                "chunks": chunk_count,
+                "pcm_chunks": pcm_chunks_sent
             })
-            logger.info("Synthesis finished: mp3_chunks=%d, synth_ms=%d", chunk_count, synthesis_ms)
+            logger.info("Synthesis finished: mp3_chunks=%d, pcm_chunks=%d, synth_ms=%d", 
+                       chunk_count, pcm_chunks_sent, synthesis_ms)
 
         except asyncio.CancelledError:
             logger.info("Cancelled")
+            if 'ffmpeg_process' in locals():
+                ffmpeg_process.kill()
+                await ffmpeg_process.wait()
             send_status({"status": "cancelled", "ts": now_iso()})
             raise
 
         except Exception as e:
             logger.exception("Synthesis error: %s", e)
+            if 'ffmpeg_process' in locals():
+                ffmpeg_process.kill()
+                await ffmpeg_process.wait()
             send_status({"status": "error", "message": str(e), "ts": now_iso()})
 
     async def _cancel_current(self):

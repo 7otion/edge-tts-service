@@ -1,3 +1,4 @@
 dist
 build
 edge_tts_service.spec
+__pycache__

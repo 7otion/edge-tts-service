@@ -11,19 +11,17 @@ A minimal Python wrapper service for Microsoft Edge TTS (Text-to-Speech), design
 ## Requirements
 - Python 3+
 - [edge-tts](https://pypi.org/project/edge-tts/)
-- ffmpeg (must be in PATH or in same directory)
 
 ## Usage
 1. Install dependencies:
    ```sh
    pip install edge-tts
    ```
-2. Make sure `ffmpeg` is installed.
-3. Run the service:
+2. Run the service:
    ```sh
    python edge_tts_service.py
    ```
-4. Communicate with the service using JSON lines via stdin/stdout.
+3. Communicate with the service using JSON lines via stdin/stdout.
 
 ## Example Commands
 - Speak text:
